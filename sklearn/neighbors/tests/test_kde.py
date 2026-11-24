@@ -71,11 +71,11 @@ def test_kernel_density(kernel, bandwidth):
 @pytest.mark.parametrize("breadth_first", [True, False])
 @pytest.mark.parametrize("rtol", [0, 1e-5])
 def test_kde_log_density_narrow_gaussian(algorithm, breadth_first, rtol):
-    # Compare in log space: exponentiating would hide errors in the tails.
-    rng = np.random.RandomState(42)
-    X = rng.normal(size=(32, 4))
-    query = rng.normal(size=(8, 4))
-    bandwidth = 0.01
+    # With leaf_size=1 the tree splits; with leaf_size=2 it has a single leaf.
+    # Exponentiating the log densities would hide the error at the first query.
+    X = np.array([[0, 7], [5, 0], [7, 2], [7, 0]])
+    query = np.array([[5, 5], [7, 2]])
+    bandwidth = 0.05
     squared_distances = ((query[:, None, :] - X) ** 2).sum(axis=2)
     expected = (
         logsumexp(-0.5 * squared_distances / bandwidth**2, axis=1)
@@ -83,7 +83,7 @@ def test_kde_log_density_narrow_gaussian(algorithm, breadth_first, rtol):
         - X.shape[1] * np.log(np.sqrt(2 * np.pi) * bandwidth)
     )
 
-    for leaf_size in (1, 4, 16):
+    for leaf_size in (1, 2):
         kde = KernelDensity(
             bandwidth=bandwidth,
             algorithm=algorithm,
