@@ -182,7 +182,7 @@ cdef extern from *:
 
 cimport numpy as cnp
 from cython cimport floating, critical_section
-from libc.math cimport fabs, sqrt, exp, cos, pow, log, lgamma
+from libc.math cimport fabs, sqrt, exp, expm1, cos, pow, log, lgamma
 from libc.math cimport fmin, fmax
 from libc.stdlib cimport calloc, malloc, free
 from libc.string cimport memcpy
@@ -374,7 +374,7 @@ cdef float64_t logsubexp(float64_t x1, float64_t x2):
     if x1 <= x2:
         return NEG_INF
     else:
-        return x1 + log(1 - exp(x2 - x1))
+        return x1 + log(-expm1(x2 - x1))
 
 
 ######################################################################
@@ -1509,10 +1509,6 @@ cdef class BinaryTree{{name_suffix}}:
         cdef float64_t h_c = h
         cdef float64_t log_atol = log(atol)
         cdef float64_t log_rtol = log(rtol)
-        cdef float64_t log_min_bound, log_max_bound, log_bound_spread
-        cdef float64_t dist_LB = 0, dist_UB = 0
-
-        cdef intp_t n_samples = self.data.shape[0]
         cdef intp_t n_features = self.data.shape[1]
         cdef intp_t i
         cdef KernelType kernel_c
@@ -1551,47 +1547,22 @@ cdef class BinaryTree{{name_suffix}}:
 
         cdef const {{INPUT_DTYPE_t}}* pt = &Xarr[0, 0]
 
-        cdef NodeHeap nodeheap
+        cdef NodeHeap nodeheap = None
+        cdef float64_t[::1] upper_distances = None
+        cdef intp_t[::1] stack = None
         if breadth_first:
             nodeheap = NodeHeap(self.data.shape[0] // self.leaf_size)
-        cdef float64_t[::1] node_log_min_bounds
-        cdef float64_t[::1] node_bound_widths
-        # TODO: implement dual tree approach.
-        #       this is difficult because of the need to cache values
-        #       computed between node pairs.
-        if breadth_first:
-            node_log_min_bounds_arr = np.full(self.n_nodes, -np.inf)
-            node_log_min_bounds = node_log_min_bounds_arr
-            node_bound_widths_arr = np.zeros(self.n_nodes)
-            node_bound_widths = node_bound_widths_arr
-            for i in range(Xarr.shape[0]):
-                log_density[i] = self._kde_single_breadthfirst(
-                                            pt, kernel_c, h_c,
-                                            log_knorm, log_atol, log_rtol,
-                                            nodeheap,
-                                            &node_log_min_bounds[0],
-                                            &node_bound_widths[0])
-                pt += n_features
+            upper_distances = np.empty(self.n_nodes, dtype=np.float64)
         else:
-            for i in range(Xarr.shape[0]):
-                min_max_dist{{name_suffix}}(self, 0, pt, &dist_LB, &dist_UB)
-                # compute max & min bounds on density within top node
-                log_min_bound = (log(self.sum_weight) +
-                                 compute_log_kernel(dist_UB,
-                                                    h_c, kernel_c))
-                log_max_bound = (log(self.sum_weight) +
-                                 compute_log_kernel(dist_LB,
-                                                    h_c, kernel_c))
-                log_bound_spread = logsubexp(log_max_bound, log_min_bound)
-                self._kde_single_depthfirst(0, pt, kernel_c, h_c,
-                                            log_knorm, log_atol, log_rtol,
-                                            log_min_bound,
-                                            log_bound_spread,
-                                            &log_min_bound,
-                                            &log_bound_spread)
-                log_density[i] = logaddexp(log_min_bound,
-                                           log_bound_spread - log(2))
-                pt += n_features
+            # At most one sibling per level waits on the depth-first stack.
+            stack = np.empty(self.n_levels, dtype=np.intp)
+
+        for i in range(Xarr.shape[0]):
+            log_density[i] = self._kde_single(
+                pt, kernel_c, h_c, log_knorm, log_atol, log_rtol,
+                nodeheap, upper_distances, stack,
+            )
+            pt += n_features
 
         # normalize the results
         for i in range(log_density.shape[0]):
@@ -2053,315 +2024,113 @@ cdef class BinaryTree{{name_suffix}}:
 
         return count
 
-    cdef float64_t _kde_single_breadthfirst(
-        self, const {{INPUT_DTYPE_t}}* pt,
-        KernelType kernel,
-        float64_t h,
-        float64_t log_knorm,
-        float64_t log_atol,
-        float64_t log_rtol,
-        NodeHeap nodeheap,
-        float64_t* node_log_min_bounds,
-        float64_t* node_log_bound_spreads,
-    ):
-        """non-recursive single-tree kernel density estimation"""
-        # For the given point, node_log_min_bounds and node_log_bound_spreads
-        # will encode the current bounds on the density between the point
-        # and the associated node.
-        # The variables global_log_min_bound and global_log_bound_spread
-        # keep track of the global bounds on density.  The procedure here is
-        # to split nodes, updating these bounds, until the bounds are within
-        # atol & rtol.
-        cdef intp_t i, i1, i2, i_node
-        cdef float64_t N1, N2
-        cdef float64_t global_log_min_bound, global_log_bound_spread
-        cdef float64_t global_log_max_bound
-
-        cdef const {{INPUT_DTYPE_t}}* data = &self.data[0, 0]
-        cdef bint with_sample_weight = self.sample_weight is not None
-        cdef const {{INPUT_DTYPE_t}}* sample_weight
-        if with_sample_weight:
-            sample_weight = &self.sample_weight[0]
-        cdef intp_t* idx_array = &self.idx_array[0]
-        cdef const NodeData_t* node_data = &self.node_data[0]
-        cdef float64_t N
-        cdef float64_t log_weight
-        if with_sample_weight:
-            N = self.sum_weight
-        else:
-            N = <float64_t> self.data.shape[0]
-        cdef intp_t n_features = self.data.shape[1]
-
-        cdef NodeData_t node_info
-        cdef float64_t dist_pt, log_density
-        cdef float64_t dist_LB_1 = 0, dist_LB_2 = 0
-        cdef float64_t dist_UB_1 = 0, dist_UB_2 = 0
-
-        cdef float64_t dist_UB, dist_LB
-
-        # push the top node to the heap
-        cdef NodeHeapData_t nodeheap_item
-        nodeheap_item.val = min_dist{{name_suffix}}(self, 0, pt)
-        nodeheap_item.i1 = 0
-        nodeheap.push(nodeheap_item)
-
-        global_log_min_bound = log(N) + compute_log_kernel(
-            max_dist{{name_suffix}}(self, 0, pt), h, kernel
-        )
-        global_log_max_bound = log(N) + compute_log_kernel(nodeheap_item.val,
-                                                           h, kernel)
-        global_log_bound_spread = logsubexp(global_log_max_bound,
-                                            global_log_min_bound)
-
-        node_log_min_bounds[0] = global_log_min_bound
-        node_log_bound_spreads[0] = global_log_bound_spread
-
-        while nodeheap.n > 0:
-            nodeheap_item = nodeheap.pop()
-            i_node = nodeheap_item.i1
-
-            node_info = node_data[i_node]
-            if with_sample_weight:
-                N1 = _total_node_weight(node_data, sample_weight,
-                                        idx_array, i_node)
-            else:
-                N1 = node_info.idx_end - node_info.idx_start
-
-            # ------------------------------------------------------------
-            # Case 1: local bounds are equal to within per-point tolerance.
-            if (log_knorm + node_log_bound_spreads[i_node] - log(N1) + log(N)
-                <= logaddexp(log_atol, (log_rtol + log_knorm
-                                        + node_log_min_bounds[i_node]))):
-                pass
-
-            # ------------------------------------------------------------
-            # Case 2: global bounds are within rtol & atol.
-            elif (log_knorm + global_log_bound_spread
-                  <= logaddexp(log_atol,
-                               log_rtol + log_knorm + global_log_min_bound)):
-                break
-
-            # ------------------------------------------------------------
-            # Case 3: node is a leaf. Count contributions from all points
-            elif node_info.is_leaf:
-                global_log_min_bound =\
-                    logsubexp(global_log_min_bound,
-                              node_log_min_bounds[i_node])
-                global_log_bound_spread =\
-                    logsubexp(global_log_bound_spread,
-                              node_log_bound_spreads[i_node])
-                for i in range(node_info.idx_start, node_info.idx_end):
-                    dist_pt = self.dist(pt, data + n_features * idx_array[i],
-                                        n_features)
-                    log_density = compute_log_kernel(dist_pt, h, kernel)
-                    if with_sample_weight:
-                        log_weight = np.log(sample_weight[idx_array[i]])
-                    else:
-                        log_weight = 0.
-                    global_log_min_bound = logaddexp(global_log_min_bound,
-                                                     log_density + log_weight)
-
-            # ------------------------------------------------------------
-            # Case 4: split node and query subnodes
-            else:
-                i1 = 2 * i_node + 1
-                i2 = 2 * i_node + 2
-
-                if with_sample_weight:
-                    N1 = _total_node_weight(node_data, sample_weight,
-                                            idx_array, i1)
-                    N2 = _total_node_weight(node_data, sample_weight,
-                                            idx_array, i2)
-                else:
-                    N1 = node_data[i1].idx_end - node_data[i1].idx_start
-                    N2 = node_data[i2].idx_end - node_data[i2].idx_start
-
-                min_max_dist{{name_suffix}}(self, i1, pt, &dist_LB_1, &dist_UB_1)
-                min_max_dist{{name_suffix}}(self, i2, pt, &dist_LB_2, &dist_UB_2)
-
-                node_log_min_bounds[i1] = (log(N1) +
-                                           compute_log_kernel(dist_UB_1,
-                                                              h, kernel))
-                node_log_bound_spreads[i1] = (log(N1) +
-                                              compute_log_kernel(dist_LB_1,
-                                                                 h, kernel))
-
-                node_log_min_bounds[i2] = (log(N2) +
-                                           compute_log_kernel(dist_UB_2,
-                                                              h, kernel))
-                node_log_bound_spreads[i2] = (log(N2) +
-                                              compute_log_kernel(dist_LB_2,
-                                                                 h, kernel))
-
-                global_log_min_bound = logsubexp(global_log_min_bound,
-                                                 node_log_min_bounds[i_node])
-                global_log_min_bound = logaddexp(global_log_min_bound,
-                                                 node_log_min_bounds[i1])
-                global_log_min_bound = logaddexp(global_log_min_bound,
-                                                 node_log_min_bounds[i2])
-
-                global_log_bound_spread =\
-                    logsubexp(global_log_bound_spread,
-                              node_log_bound_spreads[i_node])
-                global_log_bound_spread = logaddexp(global_log_bound_spread,
-                                                    node_log_bound_spreads[i1])
-                global_log_bound_spread = logaddexp(global_log_bound_spread,
-                                                    node_log_bound_spreads[i2])
-
-                # TODO: rank by the spread rather than the distance?
-                nodeheap_item.val = dist_LB_1
-                nodeheap_item.i1 = i1
-                nodeheap.push(nodeheap_item)
-
-                nodeheap_item.val = dist_LB_2
-                nodeheap_item.i1 = i2
-                nodeheap.push(nodeheap_item)
-
-        nodeheap.clear()
-        return logaddexp(global_log_min_bound,
-                         global_log_bound_spread - log(2))
-
-    cdef int _kde_single_depthfirst(
+    cdef float64_t _kde_single(
         self,
-        intp_t i_node,
         const {{INPUT_DTYPE_t}}* pt,
         KernelType kernel,
         float64_t h,
         float64_t log_knorm,
         float64_t log_atol,
         float64_t log_rtol,
-        float64_t local_log_min_bound,
-        float64_t local_log_bound_spread,
-        float64_t* global_log_min_bound,
-        float64_t* global_log_bound_spread,
-    ) except -1:
-        """recursive single-tree kernel density estimate, depth-first"""
-        # For the given point, local_min_bound and local_max_bound give the
-        # minimum and maximum density for the current node, while
-        # global_min_bound and global_max_bound give the minimum and maximum
-        # density over the entire tree.  We recurse down until global_min_bound
-        # and global_max_bound are within rtol and atol.
-        cdef intp_t i, i1, i2, iw, start, end
-        cdef float64_t N1, N2
-
-        cdef const {{INPUT_DTYPE_t}}* data = &self.data[0, 0]
-        cdef const NodeData_t* node_data = &self.node_data[0]
-        cdef bint with_sample_weight = self.sample_weight is not None
-        cdef const {{INPUT_DTYPE_t}}* sample_weight
-        cdef float64_t log_weight
-        if with_sample_weight:
-            sample_weight = &self.sample_weight[0]
-        cdef intp_t* idx_array = &self.idx_array[0]
+        NodeHeap nodeheap,
+        float64_t[::1] upper_distances,
+        intp_t[::1] stack,
+    ):
+        """Sum disjoint node contributions without subtracting density bounds."""
+        cdef bint breadth_first = nodeheap is not None
+        cdef bint weighted = self.sample_weight is not None
+        cdef const NodeData_t* nodes = &self.node_data[0]
+        cdef const intp_t* indices = &self.idx_array[0]
         cdef intp_t n_features = self.data.shape[1]
+        cdef intp_t i_node = 0, i, child, idx, stack_size = 0
+        cdef NodeHeapData_t item
+        cdef float64_t dist_min = 0, dist_max = 0
+        cdef float64_t log_min, log_max, log_kernel, node_weight
+        cdef float64_t leaf_max, scaled_sum
+        cdef float64_t log_density = NEG_INF
+        cdef float64_t log_total_weight = log(self.sum_weight)
 
-        cdef NodeData_t node_info = self.node_data[i_node]
-        cdef float64_t dist_pt, log_dens_contribution
+        # Work with unnormalized kernels. Allocate absolute and relative error
+        # to each node in proportion to its weight. For a total weight W and a
+        # partial sum L of accepted contributions, we can spend (atol + rtol * L) / W
+        # per unit weight. Disjoint pruned nodes have total weight at most W.
+        cdef float64_t log_abs_per_weight = log_atol - log_knorm - log_total_weight
+        cdef float64_t log_rel_per_weight = log_rtol - log_total_weight
+        cdef float64_t log_tol
+        min_max_dist{{name_suffix}}(self, 0, pt, &dist_min, &dist_max)
+        log_tol = log_abs_per_weight
 
-        cdef float64_t child1_log_min_bound, child2_log_min_bound
-        cdef float64_t child1_log_bound_spread, child2_log_bound_spread
-        cdef float64_t dist_UB = 0, dist_LB = 0
+        while True:
+            log_min = compute_log_kernel(dist_max, h, kernel)
+            log_max = compute_log_kernel(dist_min, h, kernel)
 
-        if with_sample_weight:
-            N1 = _total_node_weight(node_data, sample_weight,
-                                    idx_array, i_node)
-            N2 = self.sum_weight
-        else:
-            N1 = <float64_t>(node_info.idx_end - node_info.idx_start)
-            N2 = <float64_t>self.data.shape[0]
-
-        # ------------------------------------------------------------
-        # Case 1: local bounds are equal to within errors.  Return
-        if (
-            log_knorm + local_log_bound_spread - log(N1) + log(N2)
-            <= logaddexp(log_atol, (log_rtol + log_knorm + local_log_min_bound))
-        ):
-            pass
-
-        # ------------------------------------------------------------
-        # Case 2: global bounds are within rtol & atol. Return
-        elif (
-            log_knorm + global_log_bound_spread[0]
-            <= logaddexp(log_atol, (log_rtol + log_knorm + global_log_min_bound[0]))
-        ):
-            pass
-
-        # ------------------------------------------------------------
-        # Case 3: node is a leaf. Count contributions from all points
-        elif node_info.is_leaf:
-            global_log_min_bound[0] = logsubexp(global_log_min_bound[0],
-                                                local_log_min_bound)
-            global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],
-                                                   local_log_bound_spread)
-            for i in range(node_info.idx_start, node_info.idx_end):
-                dist_pt = self.dist(pt, (data + n_features * idx_array[i]),
-                                    n_features)
-                log_dens_contribution = compute_log_kernel(dist_pt, h, kernel)
-                if with_sample_weight:
-                    log_weight = np.log(sample_weight[idx_array[i]])
+            if log_max == NEG_INF or (log_density != NEG_INF and log_max <= log_tol):
+                # With the nearest pending node first, all remaining kernels
+                # are at most this large, including those in its descendants.
+                if breadth_first:
+                    nodeheap.clear()
+                    break
+            elif logsubexp(log_max, log_min) <= log_tol:
+                if weighted:
+                    node_weight = _total_node_weight(
+                        nodes, &self.sample_weight[0], indices, i_node
+                    )
                 else:
-                    log_weight = 0.
-                global_log_min_bound[0] = logaddexp(global_log_min_bound[0],
-                                                    (log_dens_contribution +
-                                                     log_weight))
-
-        # ------------------------------------------------------------
-        # Case 4: split node and query subnodes
-        else:
-            i1 = 2 * i_node + 1
-            i2 = 2 * i_node + 2
-
-            if with_sample_weight:
-                N1 = _total_node_weight(node_data, sample_weight,
-                                        idx_array, i1)
-                N2 = _total_node_weight(node_data, sample_weight,
-                                        idx_array, i2)
+                    node_weight = nodes[i_node].idx_end - nodes[i_node].idx_start
+                log_kernel = logaddexp(log_min, log_max) - log(2)
+                log_density = logaddexp(log_density, log(node_weight) + log_kernel)
+            elif nodes[i_node].is_leaf:
+                # Scale by the largest log-kernel seen in this leaf. The
+                # geometric upper bound can be far above every actual term.
+                leaf_max = NEG_INF
+                scaled_sum = 0
+                for i in range(nodes[i_node].idx_start, nodes[i_node].idx_end):
+                    idx = indices[i]
+                    log_kernel = compute_log_kernel(
+                        self.dist(pt, &self.data[idx, 0], n_features), h, kernel
+                    )
+                    if weighted:
+                        log_kernel += log(self.sample_weight[idx])
+                    if log_kernel > leaf_max:
+                        scaled_sum = scaled_sum * exp(leaf_max - log_kernel) + 1
+                        leaf_max = log_kernel
+                    elif log_kernel != NEG_INF:
+                        scaled_sum += exp(log_kernel - leaf_max)
+                log_density = logaddexp(log_density, leaf_max + log(scaled_sum))
             else:
-                N1 = <float64_t>(self.node_data[i1].idx_end - self.node_data[i1].idx_start)
-                N2 = <float64_t>(self.node_data[i2].idx_end - self.node_data[i2].idx_start)
+                if breadth_first:
+                    for child in range(2 * i_node + 1, 2 * i_node + 3):
+                        min_max_dist{{name_suffix}}(self, child, pt, &dist_min, &dist_max)
+                        item.val = dist_min
+                        item.i1 = child
+                        upper_distances[child] = dist_max
+                        nodeheap.push(item)
+                else:
+                    stack[stack_size] = 2 * i_node + 2
+                    stack_size += 1
+                    i_node = 2 * i_node + 1
+                    min_max_dist{{name_suffix}}(self, i_node, pt, &dist_min, &dist_max)
+                    continue
 
-            min_max_dist{{name_suffix}}(self, i1, pt, &dist_LB, &dist_UB)
-            child1_log_min_bound = log(N1) + compute_log_kernel(dist_UB, h,
-                                                                kernel)
-            child1_log_bound_spread = logsubexp(log(N1) +
-                                                compute_log_kernel(dist_LB, h,
-                                                                   kernel),
-                                                child1_log_min_bound)
+            # The partial sum only increases, so each node's error budget is
+            # bounded by its share of the tolerance on the returned density.
+            if log_rtol != NEG_INF:
+                log_tol = logaddexp(log_abs_per_weight, log_rel_per_weight + log_density)
+            if breadth_first:
+                if nodeheap.n == 0:
+                    break
+                item = nodeheap.pop()
+                i_node = item.i1
+                dist_min = item.val
+                dist_max = upper_distances[i_node]
+            else:
+                if stack_size == 0:
+                    break
+                stack_size -= 1
+                i_node = stack[stack_size]
+                min_max_dist{{name_suffix}}(self, i_node, pt, &dist_min, &dist_max)
 
-            min_max_dist{{name_suffix}}(self, i2, pt, &dist_LB, &dist_UB)
-            child2_log_min_bound = log(N2) + compute_log_kernel(dist_UB, h,
-                                                                kernel)
-            child2_log_bound_spread = logsubexp(log(N2) +
-                                                compute_log_kernel(dist_LB, h,
-                                                                   kernel),
-                                                child2_log_min_bound)
-
-            global_log_min_bound[0] = logsubexp(global_log_min_bound[0],
-                                                local_log_min_bound)
-            global_log_min_bound[0] = logaddexp(global_log_min_bound[0],
-                                                child1_log_min_bound)
-            global_log_min_bound[0] = logaddexp(global_log_min_bound[0],
-                                                child2_log_min_bound)
-
-            global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],
-                                                   local_log_bound_spread)
-            global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],
-                                                   child1_log_bound_spread)
-            global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],
-                                                   child2_log_bound_spread)
-
-            self._kde_single_depthfirst(i1, pt, kernel, h, log_knorm,
-                                        log_atol, log_rtol,
-                                        child1_log_min_bound,
-                                        child1_log_bound_spread,
-                                        global_log_min_bound,
-                                        global_log_bound_spread)
-            self._kde_single_depthfirst(i2, pt, kernel, h, log_knorm,
-                                        log_atol, log_rtol,
-                                        child2_log_min_bound,
-                                        child2_log_bound_spread,
-                                        global_log_min_bound,
-                                        global_log_bound_spread)
-        return 0
+        return log_density
 
     cdef int _two_point_single(
         self,

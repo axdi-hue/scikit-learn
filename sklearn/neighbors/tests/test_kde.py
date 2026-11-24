@@ -1,6 +1,7 @@
 import joblib
 import numpy as np
 import pytest
+from scipy.special import logsumexp
 
 from sklearn.datasets import make_blobs
 from sklearn.exceptions import NotFittedError
@@ -64,6 +65,33 @@ def test_kernel_density(kernel, bandwidth):
         for atol in [1e-6, 1e-2]:
             for breadth_first in (True, False):
                 check_results(kernel, bandwidth, atol, rtol, X, Y, dens_true)
+
+
+@pytest.mark.parametrize("algorithm", ["kd_tree", "ball_tree"])
+@pytest.mark.parametrize("breadth_first", [True, False])
+@pytest.mark.parametrize("rtol", [0, 1e-5])
+def test_kde_log_density_narrow_gaussian(algorithm, breadth_first, rtol):
+    # Compare in log space: exponentiating would hide errors in the tails.
+    rng = np.random.RandomState(42)
+    X = rng.normal(size=(32, 4))
+    query = rng.normal(size=(8, 4))
+    bandwidth = 0.01
+    squared_distances = ((query[:, None, :] - X) ** 2).sum(axis=2)
+    expected = (
+        logsumexp(-0.5 * squared_distances / bandwidth**2, axis=1)
+        - np.log(len(X))
+        - X.shape[1] * np.log(np.sqrt(2 * np.pi) * bandwidth)
+    )
+
+    for leaf_size in (1, 4, 16):
+        kde = KernelDensity(
+            bandwidth=bandwidth,
+            algorithm=algorithm,
+            breadth_first=breadth_first,
+            leaf_size=leaf_size,
+            rtol=rtol,
+        ).fit(X)
+        assert_allclose(kde.score_samples(query), expected, rtol=0, atol=rtol + 1e-9)
 
 
 def test_kernel_density_sampling(n_samples=100, n_features=3):
